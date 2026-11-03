@@ -75,66 +75,80 @@ def parse_bandwidth_metrics(powermetrics_parse):
     return bandwidth_metrics_dict
 
 
-def parse_cpu_metrics(powermetrics_parse):
-    e_core = []
-    p_core = []
+def cluster_prefix(name):
+    return name.split("-")[0].rstrip("0123456789")
+
+
+def cluster_tier(prefix, cpu_count, e_core_count, p_core_count):
+    # "E" is the lower tier (hw.perflevel1), "P" the higher one (hw.perflevel0).
+    if e_core_count != p_core_count:
+        if cpu_count == e_core_count:
+            return "E"
+        if cpu_count == p_core_count:
+            return "P"
+    return "E" if prefix == "E" else "P"
+
+
+def active_ratio(sample):
+    idle = sample.get("idle_ratio", 1.0)
+    return 1 - min(max(idle, 0.0), 1.0)
+
+
+def freq_mhz(sample):
+    return int(sample.get("freq_hz", 0)/(1e6))
+
+
+def parse_cpu_metrics(powermetrics_parse, e_core_count=None, p_core_count=None):
     cpu_metrics = powermetrics_parse["processor"]
     cpu_metric_dict = {}
     # cpu_clusters
-    cpu_clusters = cpu_metrics["clusters"]
-    for cluster in cpu_clusters:
+    groups = {}
+    for cluster in cpu_metrics.get("clusters", []):
         name = cluster["name"]
-        cpu_metric_dict[name+"_freq_Mhz"] = int(cluster["freq_hz"]/(1e6))
-        cpu_metric_dict[name+"_active"] = int((1 - cluster["idle_ratio"])*100)
-        for cpu in cluster["cpus"]:
-            name = 'E-Cluster' if name[0] == 'E' else 'P-Cluster'
-            core = e_core if name[0] == 'E' else p_core
-            core.append(cpu["cpu"])
-            cpu_metric_dict[name + str(cpu["cpu"]) + "_freq_Mhz"] = int(cpu["freq_hz"] / (1e6))
-            cpu_metric_dict[name + str(cpu["cpu"]) + "_active"] = int((1 - cpu["idle_ratio"]) * 100)
-    cpu_metric_dict["e_core"] = e_core
-    cpu_metric_dict["p_core"] = p_core
-    if "E-Cluster_active" not in cpu_metric_dict:
-        # M1 Ultra
-        cpu_metric_dict["E-Cluster_active"] = int(
-            (cpu_metric_dict["E0-Cluster_active"] + cpu_metric_dict["E1-Cluster_active"])/2)
-    if "E-Cluster_freq_Mhz" not in cpu_metric_dict:
-        # M1 Ultra
-        cpu_metric_dict["E-Cluster_freq_Mhz"] = max(
-            cpu_metric_dict["E0-Cluster_freq_Mhz"], cpu_metric_dict["E1-Cluster_freq_Mhz"])
-    if "P-Cluster_active" not in cpu_metric_dict:
-        if "P2-Cluster_active" in cpu_metric_dict:
-            # M1 Ultra
-            cpu_metric_dict["P-Cluster_active"] = int((cpu_metric_dict["P0-Cluster_active"] + cpu_metric_dict["P1-Cluster_active"] +
-                                                      cpu_metric_dict["P2-Cluster_active"] + cpu_metric_dict["P3-Cluster_active"]) / 4)
-        else:
-            cpu_metric_dict["P-Cluster_active"] = int(
-                (cpu_metric_dict["P0-Cluster_active"] + cpu_metric_dict["P1-Cluster_active"])/2)
-    if "P-Cluster_freq_Mhz" not in cpu_metric_dict:
-        if "P2-Cluster_freq_Mhz" in cpu_metric_dict:
-            # M1 Ultra
-            freqs = [
-                cpu_metric_dict["P0-Cluster_freq_Mhz"],
-                cpu_metric_dict["P1-Cluster_freq_Mhz"],
-                cpu_metric_dict["P2-Cluster_freq_Mhz"],
-                cpu_metric_dict["P3-Cluster_freq_Mhz"]]
-            cpu_metric_dict["P-Cluster_freq_Mhz"] = max(freqs)
-        else:
-            cpu_metric_dict["P-Cluster_freq_Mhz"] = max(
-                cpu_metric_dict["P0-Cluster_freq_Mhz"], cpu_metric_dict["P1-Cluster_freq_Mhz"])
+        cpu_metric_dict[name+"_freq_Mhz"] = freq_mhz(cluster)
+        cpu_metric_dict[name+"_active"] = int(active_ratio(cluster)*100)
+        groups.setdefault(cluster_prefix(name), []).append(cluster)
+    tiers = {"E": [], "P": []}
+    for prefix, clusters in groups.items():
+        cpu_count = sum(len(c.get("cpus") or []) for c in clusters)
+        tiers[cluster_tier(prefix, cpu_count, e_core_count, p_core_count)].extend(clusters)
+    for tier, clusters in tiers.items():
+        name = tier + "-Cluster"
+        cores = []
+        busy = 0.0
+        weight = 0
+        busy_freq = 0.0
+        max_freq = 0
+        for cluster in clusters:
+            cpus = cluster.get("cpus") or []
+            for sample in cpus or [cluster]:
+                active = active_ratio(sample)
+                freq = freq_mhz(sample)
+                busy += active
+                weight += 1
+                busy_freq += freq * active
+                max_freq = max(max_freq, freq)
+                if sample is not cluster and "cpu" in sample:
+                    key = name + str(sample["cpu"])
+                    cores.append(sample["cpu"])
+                    cpu_metric_dict[key + "_freq_Mhz"] = freq
+                    cpu_metric_dict[key + "_active"] = int(active * 100)
+        cpu_metric_dict[tier.lower() + "_core"] = cores
+        cpu_metric_dict[name + "_active"] = int(busy / weight * 100) if weight else 0
+        cpu_metric_dict[name + "_freq_Mhz"] = round(busy_freq / busy) if busy > 0 else max_freq
     # power
-    cpu_metric_dict["ane_W"] = cpu_metrics["ane_energy"]/1000
+    cpu_metric_dict["ane_W"] = cpu_metrics.get("ane_energy", 0)/1000
     #cpu_metric_dict["dram_W"] = cpu_metrics["dram_energy"]/1000
-    cpu_metric_dict["cpu_W"] = cpu_metrics["cpu_energy"]/1000
-    cpu_metric_dict["gpu_W"] = cpu_metrics["gpu_energy"]/1000
-    cpu_metric_dict["package_W"] = cpu_metrics["combined_power"]/1000
+    cpu_metric_dict["cpu_W"] = cpu_metrics.get("cpu_energy", 0)/1000
+    cpu_metric_dict["gpu_W"] = cpu_metrics.get("gpu_energy", 0)/1000
+    cpu_metric_dict["package_W"] = cpu_metrics.get("combined_power", 0)/1000
     return cpu_metric_dict
 
 
 def parse_gpu_metrics(powermetrics_parse):
-    gpu_metrics = powermetrics_parse["gpu"]
+    gpu_metrics = powermetrics_parse.get("gpu") or {}
     gpu_metrics_dict = {
-        "freq_MHz": int(gpu_metrics["freq_hz"]),
-        "active": int((1 - gpu_metrics["idle_ratio"])*100),
+        "freq_MHz": int(gpu_metrics.get("freq_hz", 0)),
+        "active": int(active_ratio(gpu_metrics)*100),
     }
     return gpu_metrics_dict

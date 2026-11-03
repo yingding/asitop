@@ -7,7 +7,7 @@ from .parsers import *
 import plistlib
 
 
-def parse_powermetrics(path='/tmp/asitop_powermetrics', timecode="0"):
+def parse_powermetrics(path='/tmp/asitop_powermetrics', timecode="0", e_core_count=None, p_core_count=None):
     data = None
     try:
         with open(path+timecode, 'rb') as fp:
@@ -15,23 +15,25 @@ def parse_powermetrics(path='/tmp/asitop_powermetrics', timecode="0"):
         data = data.split(b'\x00')
         powermetrics_parse = plistlib.loads(data[-1])
         thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-        cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
+        cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse, e_core_count, p_core_count)
         gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
         #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
         bandwidth_metrics = None
         timestamp = powermetrics_parse["timestamp"]
         return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
     except Exception as e:
-        if data:
-            if len(data) > 1:
+        if data and len(data) > 1:
+            try:
                 powermetrics_parse = plistlib.loads(data[-2])
                 thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-                cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
+                cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse, e_core_count, p_core_count)
                 gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
                 #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
                 bandwidth_metrics = None
                 timestamp = powermetrics_parse["timestamp"]
                 return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
+            except Exception:
+                pass
         return False
 
 
@@ -107,12 +109,18 @@ def get_cpu_info():
 def get_core_counts():
     cores_info = os.popen('sysctl -a | grep hw.perflevel').read()
     cores_info_lines = cores_info.split("\n")
-    data_fields = ["hw.perflevel0.logicalcpu", "hw.perflevel1.logicalcpu"]
+    data_fields = ["hw.perflevel0.logicalcpu", "hw.perflevel1.logicalcpu",
+                   "hw.perflevel0.name", "hw.perflevel1.name"]
     cores_info_dict = {}
     for l in cores_info_lines:
         for h in data_fields:
-            if h in l:
-                value = int(l.split(":")[1].strip())
+            if l.startswith(h + ":"):
+                value = l.split(":")[1].strip()
+                if h.endswith("logicalcpu"):
+                    try:
+                        value = int(value)
+                    except ValueError:
+                        continue
                 cores_info_dict[h] = value
     return cores_info_dict
 
@@ -130,12 +138,10 @@ def get_gpu_cores():
 def get_soc_info():
     cpu_info_dict = get_cpu_info()
     core_counts_dict = get_core_counts()
-    try:
-        e_core_count = core_counts_dict["hw.perflevel1.logicalcpu"]
-        p_core_count = core_counts_dict["hw.perflevel0.logicalcpu"]
-    except:
-        e_core_count = "?"
-        p_core_count = "?"
+    e_core_count = core_counts_dict.get("hw.perflevel1.logicalcpu", 0)
+    p_core_count = core_counts_dict.get("hw.perflevel0.logicalcpu", 0)
+    e_core_name = core_counts_dict.get("hw.perflevel1.name") or "Efficiency"
+    p_core_name = core_counts_dict.get("hw.perflevel0.name") or "Performance"
     soc_info = {
         "name": cpu_info_dict["machdep.cpu.brand_string"],
         "core_count": int(cpu_info_dict["machdep.cpu.core_count"]),
@@ -145,6 +151,8 @@ def get_soc_info():
         "gpu_max_bw": None,
         "e_core_count": e_core_count,
         "p_core_count": p_core_count,
+        "e_core_name": e_core_name,
+        "p_core_name": p_core_name,
         "gpu_core_count": get_gpu_cores()
     }
     # TDP (power)
